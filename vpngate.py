@@ -7,7 +7,7 @@ VPN Gate SSTP 节点检测流水线
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
      (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
   3. 按 host+port+protocol 去重
-  4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
+  4. 并发调用已部署的 Cloudflare Worker:  先 POST /login 登录, 再 GET /admin/check?sstp=vpn:vpn@host:port
      (单节点 HTTP 成功 != 节点可用; 以 Worker 返回 JSON 的 success 字段为准)
   5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
   6. 网页端 (GitHub Pages) 读取 data.json 展示
@@ -28,7 +28,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -50,8 +50,11 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://edgetunnel.sdyt777.de5.net/check?sstp=vpn:vpn@")
+# 此版 Worker 的检测接口需要后台登录 Cookie, 且 Cookie 绑定 User-Agent。
+WORKER_CHECK_URL = os.environ.get(
+    "CHECK_WORKER", "https://edgetun.sdyt777.de5.net/admin/check?sstp=vpn:vpn@"
+)
+WORKER_USER_AGENT = "Mozilla/5.0 (gate-checker)"
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -281,6 +284,42 @@ def dedupe(nodes):
 # ---------------------------------------------------------------------------
 # 第 3 步: 并发调用 Cloudflare Worker
 # ---------------------------------------------------------------------------
+def login_worker(session):
+    """使用 GitHub Secret 注入的后台密码登录; 不打印密码、Cookie 或响应正文。"""
+    endpoint = urlsplit(WORKER_CHECK_URL)
+    if (
+        endpoint.scheme != "https" or not endpoint.hostname
+        or endpoint.username or endpoint.password or endpoint.fragment
+        or endpoint.path != "/admin/check"
+    ):
+        die("CHECK_WORKER 必须是 HTTPS /admin/check 接口, 不能使用 /check 或带登录凭据的 URL")
+    password = os.environ.get("CHECK_PASSWORD", "")
+    if not password:
+        die("缺少 CHECK_PASSWORD: 请设置同名 GitHub Actions Secret, 值为 Worker 后台登录密码")
+    # 登录和所有检测请求必须保持同一个 User-Agent。
+    session.headers.update({"User-Agent": WORKER_USER_AGENT})
+    login_url = f"{endpoint.scheme}://{endpoint.netloc}/login"
+    try:
+        response = session.post(
+            login_url, data={"password": password},
+            timeout=CHECK_TIMEOUT, allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        die(f"Worker 登录网络异常: {type(exc).__name__}; 请检查域名、TLS 和连通性")
+    if response.status_code != 200:
+        die(f"Worker 登录失败: HTTP {response.status_code}; 请检查域名、KV 绑定和后台密码")
+    try:
+        payload = response.json()
+    except ValueError:
+        die("Worker 登录没有返回 JSON; 请检查 CHECK_PASSWORD、部署版本和 KV 绑定")
+    if (
+        not isinstance(payload, dict) or payload.get("success") is not True
+        or not any(cookie.name == "auth" and cookie.value for cookie in session.cookies)
+    ):
+        die("Worker 登录未成功或未获得 auth Cookie; 请检查后台密码和 KV 绑定")
+    log("CLOUDFLARE WORKER", "后台登录成功")
+
+
 def classify_network(host, exit_org, is_datacenter=None):
     """住宅/机房分类, 按可信度排序:
     1) Worker 返回的真实 is_datacenter 标志 (IP 情报库);
@@ -315,17 +354,34 @@ def check_one(node, session):
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["status"] = "failed"
+    out["success"] = False
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = session.get(
+            url, timeout=CHECK_TIMEOUT, allow_redirects=False,
+            headers={"User-Agent": WORKER_USER_AGENT},
+        )
+        if 300 <= r.status_code < 400:
+            out["error"] = "Worker 返回重定向; 请检查登录 Cookie 和 User-Agent 是否一致"
+            out["worker_error"] = True
+            return out
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
             return out
-        j = r.json()
-        ok = bool(j.get("success"))
+        try:
+            j = r.json()
+        except ValueError:
+            out["error"] = "Worker 未返回有效 JSON (可能为登录页或伪装页); 请检查接口路径与登录状态"
+            out["worker_error"] = True
+            return out
+        if not isinstance(j, dict) or not isinstance(j.get("success"), bool):
+            out["error"] = "Worker JSON 缺少布尔类型 success 字段"
+            out["worker_error"] = True
+            return out
+        ok = j["success"]
         out["success"] = ok
         out["status"] = "success" if ok else "failed"
         out["latency_ms"] = j.get("responseTime")
@@ -333,6 +389,12 @@ def check_one(node, session):
         out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
         # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
         exit_info = j.get("exit") or {}
+        # 用户提供的 2026-10-08 版接口返回顶层 ip/loc, 不提供 ASN 或住宅属性。
+        if not exit_info and ok and j.get("ip"):
+            exit_info = {
+                "ip": str(j["ip"]).strip(),
+                "country_code": str(j.get("loc") or "").strip(),
+            }
         if exit_info:
             asn = exit_info.get("asn") or {}
             org = asn.get("org") or asn.get("name") or ""
@@ -352,7 +414,9 @@ def check_one(node, session):
             out["residential"] = classify_network(out["host"], None, None)
         return out
     except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
+        out["error"] = f"Worker 请求或响应处理异常: {type(exc).__name__}"
+        out["success"] = False
+        out["status"] = "failed"
         out["worker_error"] = True
         return out
 
@@ -644,6 +708,7 @@ def write_outputs(data):
 # ---------------------------------------------------------------------------
 def main():
     session = requests.Session()
+    login_worker(session)
 
     # 1) 数据源
     rows, source = fetch_vpngate()
@@ -679,6 +744,15 @@ def main():
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
+    # 输出错误类别, 不输出后台密码、Cookie 或完整响应正文。
+    if worker_errors:
+        error_counts = {}
+        for result in worker_errors:
+            error = result.get("error") or "未知 Worker 异常"
+            error_counts[error] = error_counts.get(error, 0) + 1
+        for error, count in sorted(error_counts.items(), key=lambda item: -item[1])[:5]:
+            log("CLOUDFLARE WORKER", f"异常明细 ({count}): {error}")
+
     # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
@@ -704,3 +778,4 @@ if __name__ == "__main__":
         raise
     except Exception as exc:
         die(f"程序异常: {type(exc).__name__}: {exc}")
+
