@@ -72,5 +72,5 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Show site URL
-        run: 'echo "site: https://jerylihub.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
+        run: 'echo "site: https://ytlq72803-ai.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
 
