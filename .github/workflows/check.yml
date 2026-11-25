@@ -66,8 +66,8 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: 'public'
-  - name: Wait for artifact to be indexed
-    run: sleep 10
+      - name: Wait for artifact to be indexed
+        run: sleep 10
 
       - name: Deploy to GitHub Pages
         id: deployment
